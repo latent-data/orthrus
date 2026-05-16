@@ -225,3 +225,26 @@ When done, run a dry sanity check:
 - `bash -n run.sh`
 
 Do not run the benchmark itself, it requires GB10 hardware you don't have.
+
+
+## Update: multi-prompt benchmarking
+
+benchmark.py must now support running multiple prompts in a single invocation.
+
+- Define a `PROMPTS` dict in benchmark.py with named entries:
+  - `"short"`: the existing default prompt (word frequency program)
+  - `"long"`: the BoundedPriorityQueue prompt (full text below)
+- Add a `--prompts` CLI arg (action=append, default=["short", "long"]) that
+  selects which named prompts to run. Reject unknown names with a clear error.
+- For each selected prompt, run all three model configurations (Orthrus
+  diffusion, Orthrus use_diffusion_mode=False, Qwen3-8B AR). Reuse the loaded
+  model across prompts within a single config to avoid reloading.
+- Summary table gets a new "prompt" column. Results JSON groups by prompt
+  name then by config.
+- Speedup ratio is reported per prompt AND as an overall (geometric mean)
+  across prompts.
+- Update README TL;DR table to show both prompts and both speedups.
+
+PROMPTS["long"] text:
+"Implement a Python class BoundedPriorityQueue backed by a binary heap, ..."
+[full prompt text as above]

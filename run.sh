@@ -41,7 +41,7 @@ if [[ "$NO_BUILD" -eq 1 ]]; then
         -v "${SCRIPT_DIR}:/workspace" \
         -w /workspace \
         "${NGC_IMAGE}" \
-        bash -c 'pip install --no-deps -r requirements.txt && python benchmark.py "$@"' -- "${BENCH_ARGS[@]}"
+        bash -c 'pip install --no-deps -r requirements.txt && python -u benchmark.py "$@"' -- "${BENCH_ARGS[@]}"
 else
     echo "==> Building image ${IMAGE} ..."
     docker build -t "${IMAGE}" "${SCRIPT_DIR}"
@@ -55,5 +55,5 @@ else
         -v "${HOME}/.cache/huggingface:/root/.cache/huggingface" \
         -v "${SCRIPT_DIR}/results:/workspace/results" \
         "${IMAGE}" \
-        python benchmark.py "${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"}"
+        python -u benchmark.py "${BENCH_ARGS[@]+"${BENCH_ARGS[@]}"}"
 fi

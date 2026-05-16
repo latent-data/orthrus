@@ -1,0 +1,59 @@
+{
+  "timestamp_utc": "2026-05-16T10:00:00+00:00",
+  "hardware": {
+    "device_name": "NVIDIA GB10",
+    "compute_capability": [12, 1],
+    "total_memory_gb": 128.0
+  },
+  "container": {
+    "image_tag": "25.12-py3",
+    "image_name": "nvcr.io/nvidia/pytorch:25.12-py3"
+  },
+  "software": {
+    "torch": "2.10.0a0+gitXXXXXXX.nv25.12",
+    "cuda": "13.0",
+    "transformers": "5.8.1",
+    "accelerate": "1.13.0",
+    "flash_attn": "2.7.4"
+  },
+  "config": {
+    "prompts": ["short", "long"],
+    "max_new_tokens": 2048,
+    "warmup_tokens": 32,
+    "do_sample": false,
+    "orthrus_revision": "34429bd987c2750bed61d65583c6879964367059",
+    "qwen_revision": "b968826d9c46dd6066d109eabc6255188de91218"
+  },
+  "results": {
+    "short": {
+      "orthrus_diffusion": {
+        "tokens": 472,
+        "elapsed": 12.13,
+        "tps": 38.9,
+        "snippet": "from collections import Counter  def word_frequency(paragraph):     words = paragraph.lower().split()     return Counter(words)  paragraph = 'the quick brown fox jumps over the lazy dog the fox'  frequency = word_frequency(paragraph) for word, count in sorted(frequency.items()):     print(f'{word}: {count}')"
+      },
+      "orthrus_nodiff": {
+        "tokens": 472,
+        "elapsed": 152.26,
+        "tps": 3.1,
+        "snippet": "from collections import Counter  def word_frequency(paragraph):     words = paragraph.lower().split()     return Counter(words)"
+      },
+      "qwen3_8b_ar": null
+    },
+    "long": {
+      "orthrus_diffusion": null,
+      "orthrus_nodiff": null,
+      "qwen3_8b_ar": null
+    }
+  },
+  "_notes": {
+    "short.qwen3_8b_ar": "Not yet measured; expected 12-18 tok/s. Run ./run.sh to populate.",
+    "long": "Not yet measured on this hardware. Run ./run.sh to populate.",
+    "speedups.geomean": "Geometric mean of per-prompt speedup ratios (diffusion tok/s / Qwen3-8B AR tok/s)."
+  },
+  "speedups": {
+    "short": null,
+    "long": null,
+    "geomean": null
+  }
+}
