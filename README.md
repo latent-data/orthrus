@@ -143,6 +143,47 @@ We tested how Orthrus's TPF and output-equivalence behave when the autoregressiv
 - A single base model (Qwen3-8B) and a fixed pair of prompts. The findings should generalize to other Qwen3 sizes structurally but have not been verified.
 - All numbers from a single hardware target (DGX Spark / GB10). Other Blackwell variants and consumer GPUs may exhibit different per-forward-pass economics that interact with the speedup.
 
+## AR equivalence verification: diff-off through Orthrus is not bit-identical to diff-on, but it is still a valid quantization-comparison path
+
+A planned follow-up investigation needs a "plain Qwen3-8B" forward path so we can compare its quantization sensitivity to Orthrus's. The cheapest such path is `use_diffusion_mode=False` through the same Orthrus model (which routes through the AR projections only). This section reports a sanity check on whether that path is faithful.
+
+`./run.sh quant_benchmark --verify-ar-equivalence` generates the same prompt twice through the loaded Orthrus model at bf16 with greedy decoding, once with `use_diffusion_mode=True` (the normal diffusion-mode path) and once with `use_diffusion_mode=False` (HF's `super().generate()` through the AR projections), then compares token sequences. Each output is truncated at its first `<|im_end|>` so that stop-criterion differences are reported separately from forward-pass differences.
+
+### Results
+
+Per-prompt shared-prefix fraction (length of common token prefix divided by diff-on truncated length):
+
+| Prompt | Diff-on tokens | Diff-off tokens (truncated) | Shared prefix | Fraction | First divergence | Diff-on token | Diff-off token | Top1-top2 logit gap | Diff-on rank | Diff-off rank |
+|---|---|---|---|---|---|---|---|---|---|---|
+| short | 472 | 477 | 470 | **99.6%** | position 470 | `!` (id 0) | ` or` (id 476) | 0.25 | 2 | 1 |
+| long  | 1441 | 1452 | 102 | **7.1%** | position 102 | ` if` (id 421) | ` self` (id 656) | 0.25 | 2 | 1 |
+
+Stop criterion: in both prompts, diff-on halts at the first `<|im_end|>` while diff-off emits it as a normal token and continues to `max_new_tokens` (cut off by the cap).
+
+### Findings
+
+**The two paths diverge from a single near-tie argmax disagreement, not a structural model difference.** Both prompts show the exact same divergence signature: at the divergence position, the top-1 and top-2 next-token logits differ by ~0.25, the diffusion-mode path picks rank-2, the AR-mode path picks rank-1. This is consistent with floating-point accumulation drift between block-mode (the diffusion path's AR-verify call processes a block of positions at once) and single-token-mode (HF's standard generate processes one position at a time) through the same weights. The two paths are using identical AR projections; the disagreement comes from how those projections' outputs are summed in fp.
+
+**The shared-prefix metric is heavily position-dependent.** A single near-tie disagreement at position 470 of a 472-token output yields 99.6% shared prefix; the same kind of disagreement at position 102 of a 1441-token output yields 7.1%. The underlying mechanism is identical; the fraction reflects only where the near-tie happens to land. A more position-independent metric would be "near-tie disagreements per K tokens" (here roughly one per 100-500 tokens regardless of total output length).
+
+**Stop-criterion divergence is a separate phenomenon.** Orthrus's diffusion-mode generate loop explicitly stops on `<|im_end|>`; HF's `super().generate()` does not stop on `<|im_end|>` under this configuration, even though both paths emit it. This is a generate-config interaction, not a forward-pass difference.
+
+**For the planned PR 4 comparison work, the diff-off path remains viable as a "plain-Qwen3" proxy** even though it diverges from diff-on on long outputs. The reason: PR 4 needs to measure how much int8 quantization perturbs vanilla-Qwen3 generation, so the relevant measurement is diff-off-bf16 vs diff-off-int8 (same code path, only weight precision differs). That comparison is internally self-consistent and isolates the weight-precision effect, regardless of whether diff-off tracks diff-on at bf16. Under the frozen-teacher claim (Orthrus's AR projections are vanilla Qwen3-8B weights), the diff-off bf16-vs-int8 comparison is a faithful proxy for vanilla Qwen3 quantization sensitivity. Backbone-extraction work (loading the AR projections into a vanilla Qwen3 architecture) is not required.
+
+### How to run
+
+```bash
+./run.sh quant_benchmark --no-build --verify-ar-equivalence
+```
+
+Default prompt set is `short, long`. Per-prompt `max_new_tokens` is set in `AR_EQUIV_PROMPT_MAX_NEW_TOKENS` at the top of `quant_benchmark.py` (short=512, long=2048) and sized to each prompt's natural output length plus modest headroom; a generous global value would only extend the diff-off arm into wasted tokens that get truncated away. Output goes to `results/ar_equivalence.json` and includes the full token-ID sequences, a per-prompt fresh-forward top-3 logit diagnostic at the first divergence position, and the aggregate findings.
+
+### Caveats
+
+- Two prompts is a small sample. Whether "one near-tie per 100-500 tokens" is a stable rate or coincidence would need more prompts to confirm.
+- The fp-drift hypothesis is consistent with the observed top1-top2 gaps but not directly verified. A more invasive test (capture logits at every position from both paths, compare directly) would close that loop.
+- The frozen-teacher claim that Orthrus's AR projections equal vanilla Qwen3-8B weights is taken at face value here. If those weights actually differ from vanilla Qwen3, the path-2 proxy argument weakens.
+
 ## Limitations and caveats
 
 - Targets sm_121 (GB10) on aarch64. Will not run as-is on x86_64 or other Blackwell variants without container adjustments.
