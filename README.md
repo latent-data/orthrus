@@ -282,6 +282,26 @@ Two new entries in the `--configs` set, both using `use_diffusion_mode=False`:
 
 Default `--configs` includes all six configurations (four diffusion-mode plus the two AR-mode); default `--prompts` is all 7 entries in `PROMPTS`. Runtime: ~2 hours wall-clock on a DGX Spark. To run only the AR arm: `--configs ar-bf16 --configs ar-int8`; the script auto-includes `ar-bf16` as the within-arm baseline.
 
+## Conclusion: this work enables quantisation in orthrus-serve
+
+The contribution of this benchmark to the question "can we serve Orthrus quantised?" is *eliminative*, not positive. It rules out the methodological doubt that the diffusion consensus mechanism might make Orthrus uniquely fragile to precision loss, which would otherwise have been a blocker for taking quantisation seriously on this architecture.
+
+What this work establishes:
+
+- **Quantisation perturbs Orthrus the same way it perturbs vanilla Qwen3-8B.** Within-arm bf16-vs-int8 comparison shows bit-identical perturbation events across 6 of 7 prompts and signature-similar perturbation on the 7th. Mechanistic: both arms share the same AR projection weights, so the same near-tie tips the same way in both.
+- **The diffusion consensus mechanism does not amplify precision errors.** The cross-arm verdict is "NOT UNIQUELY FRAGILE." The diffusion path's verify-and-resample loop propagates the AR head's output as-is rather than compounding precision noise.
+- **The `_diff` projections are a quantisation passenger.** Quantising them on top of the AR-side quantisation produces zero additional output divergence. Memory savings on the diffusion-side weights come for free.
+- **TPF degrades modestly under int8** (-7 to -10% on most prompts), and the degradation is proportional to prompt confidence: high-confidence trajectories (math: TPF 12.48 → 9.67, -23%) are hit harder than low-confidence ones (creative: TPF 2.79 → 2.77, -1%). The mechanism is that high-confidence trajectories had more near-deterministic predictions to knock off-path.
+- **Per-tensor int4 is catastrophic.** TPF collapses to ~1.0 across all prompts; the speedup mechanism is gone entirely and output is gibberish. Int4 needs calibration, per-channel scaling, or higher-bit (NF4, AWQ, GPTQ) tooling to be viable.
+
+What this work does not establish, and which is the natural scope of follow-up work in `orthrus-serve`:
+
+- **Whether the bit-level perturbation patterns hold under real production quant** (fp8 native, bitsandbytes int8, AWQ int4). The simulated cast-and-dequant here is a pessimistic-leaning numerical proxy that stores in bf16 and only round-trips the weights through int representations. The mechanistic argument (shared AR weights → shared perturbation) predicts the conclusion carries over; empirical validation requires a real implementation.
+- **Whether downstream task accuracy is preserved.** First_div and gap measure bit-level perturbation, not whether `get_weather(location="Oxford")` still parses or whether a multi-turn agent dialogue stays coherent. Tool-eval-bench and similar suites measure the right thing.
+- **Whether throughput actually improves under real quant on Blackwell.** Simulated quant doesn't touch kernels. Native fp8 / int8 quant should improve throughput too (~2× matmul on Blackwell-class hardware), but requires verifying the kernels actually fire on sm_121 rather than falling back to bf16 dequant-then-matmul paths.
+
+**Net handoff to orthrus-serve**: pick a real quant scheme (fp8 first as the cleanest starting point, AWQ-int4 / NF4 as larger-memory-savings follow-ups), wire it into the model load path, validate accuracy on tool-eval-bench, and demonstrate the diffusion speedup carries through at the quantised precision. This bench provides the methodological scaffolding (within-arm comparisons, gap-and-rank diagnostic, the comparative-not-absolute verdict pattern) and the mechanistic intuition (no unique fragility) that justify pursuing that work; the production quant pipeline and accuracy validation itself live in `orthrus-serve`. See `orthrus-serve/quantization.md` for the planned implementation.
+
 ## Limitations and caveats
 
 - Targets sm_121 (GB10) on aarch64. Will not run as-is on x86_64 or other Blackwell variants without container adjustments.
