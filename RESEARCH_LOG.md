@@ -312,7 +312,7 @@ The three open questions above are now answered empirically by sweeps run in `or
 
 **One important refinement** from orthrus-serve's work: **drafter survival under quantisation is a function of weight perturbation geometry, not bit width.** Per-row weight scaling (the natural "next step after per-tensor for accuracy") *breaks the diffusion drafter* — each row's coordinated rescale shifts logits non-uniformly, invalidating the drafter's training-time calibration against the unquantised teacher. Per-block (NVFP4) preserves the drafter partially because block-wise scales average out at the row level. Per-tensor preserves the drafter fully. This refines the "Orthrus not uniquely fragile to int8" finding into a sharper rule: the drafter is fragile to *structured per-row* perturbation (even at 8 bits) in a way it is not fragile to *uniform* or *finer-than-row* perturbation (even at 4 bits). The fix for the per-row case would be quantisation-aware drafter retraining (QAT — retraining the drafter against a per-row-quantised teacher), which belongs upstream in Orthrus training code, not in orthrus-serve.
 
-See `orthrus-serve/README.md`'s "Findings: can you quantise an Orthrus model without retraining?" section and `quantization.md`'s "Drafter survival is a spectrum" section for the full empirical breakdown including the no-diff-vs-diff drafter-only speedup measurements (fp8 2.29×, NVFP4 1.86×, fp8-row ~1.0×).
+See `orthrus-serve/RESEARCH_LOG.md`'s "Findings: can you quantise an Orthrus model without retraining?" section and `quantization.md`'s "Drafter survival is a spectrum" section for the full empirical breakdown including the no-diff-vs-diff drafter-only speedup measurements (fp8 2.29×, NVFP4 1.86×, fp8-row ~1.0×).
 
 ## Limitations and caveats
 
