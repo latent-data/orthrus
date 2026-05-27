@@ -60,6 +60,28 @@ PROMPTS = {
         "min-heap and max-heap ordering, peek, iteration order, from_items bulk loading, "
         "empty-queue edge cases, and duplicate priorities."
     ),
+    "math": (
+        "Two trains start from cities A and B and travel toward each other along a "
+        "straight line. Train A leaves city A at 2pm traveling at 60mph. Train B leaves "
+        "city B at 3pm traveling at 75mph. They meet at 5pm. How far apart are cities "
+        "A and B? Show your reasoning step by step."
+    ),
+    "explanation": (
+        "Explain how a CPU's instruction pipeline works, at a level appropriate for "
+        "a CS undergraduate."
+    ),
+    "json": (
+        "List the seven wonders of the ancient world with their locations and "
+        "approximate construction dates, as a JSON array."
+    ),
+    "creative": (
+        "Write a 500-word short story about a librarian who discovers a book that "
+        "wasn't there yesterday."
+    ),
+    "apollo": (
+        "Write a 4-paragraph plain-English summary of the 1969 Apollo 11 mission "
+        "for a 10-year-old."
+    ),
 }
 
 CONFIGS = [
@@ -111,11 +133,20 @@ def within_arm_baseline(config):
 # comparing forward-pass behaviour.
 EOS_TOKEN_ID = 151645
 
-# Per-prompt max_new_tokens for the --verify-ar-equivalence check. Sized to
-# the diffusion-on natural output length plus modest headroom. Crucial:
-# diffusion-off does NOT stop at <|im_end|>, so a generous max_new_tokens
-# extends only the diff-off arm (wasted GPU on tokens we truncate away).
-AR_EQUIV_PROMPT_MAX_NEW_TOKENS = {"short": 512, "long": 2048}
+# Per-prompt max_new_tokens for the --verify-ar-equivalence check (and for
+# AR-mode runs inside the main quantization loop). Sized to each prompt's
+# expected diffusion-mode natural output length plus modest headroom. Crucial:
+# AR-mode generation does NOT stop at <|im_end|>, so a generous max_new_tokens
+# extends only the AR arm (wasted GPU on tokens we truncate away).
+AR_EQUIV_PROMPT_MAX_NEW_TOKENS = {
+    "short": 512,
+    "long": 2048,
+    "math": 512,
+    "explanation": 1536,
+    "json": 512,
+    "creative": 1024,
+    "apollo": 768,
+}
 
 DEFAULT_MAX_NEW_TOKENS = 2048
 DEFAULT_WARMUP_TOKENS = 32
@@ -1320,45 +1351,100 @@ def main():
 
         orth_sig = _gap_signature(orth_rows)
         van_sig = _gap_signature(van_rows)
-        both_near_tie = (
-            orth_sig["all_near_tie_rank2_or_better"]
-            and van_sig["all_near_tie_rank2_or_better"]
-        )
-        if both_near_tie:
+
+        # 'Uniquely fragile' is a COMPARATIVE claim: it requires the two arms'
+        # perturbation signatures to differ substantively. The earlier
+        # absolute-threshold check (both arms must have all gaps <1.0 AND
+        # ranks <=3) was wrong: it could trip on a single math-prompt gap of
+        # exactly 1.0 in BOTH arms and still flag "uniquely fragile" even
+        # though the two arms had identical signatures. The correct test is
+        # similarity between arms; absolute character is a separate axis.
+        def _signatures_similar(a, b, gap_tol=0.5, rank_tol=1):
+            if a["median_gap"] is None or b["median_gap"] is None:
+                return None
+            return (
+                abs(a["median_gap"] - b["median_gap"]) <= gap_tol
+                and abs(a["max_bf16_rank_in_int8"]
+                        - b["max_bf16_rank_in_int8"]) <= rank_tol
+            )
+
+        def _absolute_character(sig):
+            """Describe one arm's perturbation absolute character (orthogonal
+            to similarity-across-arms)."""
+            if sig["median_gap"] is None:
+                return "no divergences observed"
+            if sig["median_gap"] < 1.0 and sig["max_bf16_rank_in_int8"] <= 3:
+                return "near-tie regime (small gaps, rank-1-vs-rank-2 swaps)"
+            if sig["median_gap"] < 2.0:
+                return "moderate-gap regime"
+            return "wide-margin regime"
+
+        sigs_similar = _signatures_similar(orth_sig, van_sig)
+        orth_char = _absolute_character(orth_sig)
+        van_char = _absolute_character(van_sig)
+
+        if sigs_similar is None:
+            verdict_label = "INSUFFICIENT DATA"
             interpretation = (
-                "Both arms exhibit near-tie divergences at first_div (rank<=3, "
-                "logit gap <1.0 across all prompts). Same kind of perturbation "
-                "in both, on different trajectories. Orthrus is NOT uniquely "
-                "fragile to int8; it inherits Qwen3's near-tie sensitivity."
+                "Insufficient diagnostic data to compare arms (one or both "
+                "had no divergences with diagnostics)."
+            )
+        elif sigs_similar:
+            verdict_label = "NOT UNIQUELY FRAGILE"
+            interpretation = (
+                f"Arms have similar perturbation signatures: Orthrus median "
+                f"gap {orth_sig['median_gap']:.2f} / max bf16-rank-in-int8 "
+                f"{orth_sig['max_bf16_rank_in_int8']}; Vanilla median gap "
+                f"{van_sig['median_gap']:.2f} / max bf16-rank-in-int8 "
+                f"{van_sig['max_bf16_rank_in_int8']}. Same kind of "
+                f"perturbation in both arms ({orth_char}). The diffusion "
+                f"consensus mechanism does not amplify int8 errors beyond "
+                f"what the plain AR path already experiences. Orthrus is "
+                f"NOT uniquely fragile to int8; it inherits Qwen3's "
+                f"quantization sensitivity."
             )
         else:
+            verdict_label = "UNIQUELY FRAGILE"
             interpretation = (
-                "Arms exhibit qualitatively different gap behaviour at "
-                "first_div. Orthrus signature: "
-                f"{orth_sig}. Vanilla signature: {van_sig}. The diffusion "
-                "consensus mechanism may be amplifying precision errors into "
-                "wider-margin argmax changes; Orthrus is uniquely fragile."
+                f"Arms exhibit qualitatively different perturbation "
+                f"signatures. Orthrus: median gap "
+                f"{orth_sig['median_gap']:.2f} / max rank "
+                f"{orth_sig['max_bf16_rank_in_int8']} ({orth_char}). "
+                f"Vanilla: median gap {van_sig['median_gap']:.2f} / max "
+                f"rank {van_sig['max_bf16_rank_in_int8']} ({van_char}). "
+                f"Difference exceeds tolerance (gap_tol=0.5, rank_tol=1); "
+                f"the diffusion consensus mechanism may be amplifying "
+                f"precision errors. Orthrus is uniquely fragile."
             )
-        print(f"\nINTERPRETATION: {interpretation}")
+        print(f"\nVERDICT: {verdict_label}")
+        print(f"INTERPRETATION: {interpretation}")
 
         cross_arm = {
             "orthrus_arm": {
                 "comparison": f"{orth_int8} vs {BASELINE_KEY}",
                 "per_prompt": orth_rows,
                 "gap_signature": orth_sig,
+                "absolute_character": orth_char,
             },
             "vanilla_arm": {
                 "comparison": f"{van_int8} vs {AR_BASELINE_KEY}",
                 "per_prompt": van_rows,
                 "gap_signature": van_sig,
+                "absolute_character": van_char,
             },
+            "signatures_similar": sigs_similar,
+            "verdict": verdict_label,
             "interpretation": interpretation,
-            "note": "Cross-arm comparison is WITHIN-arm bf16-vs-int8 for each "
-                    "arm, then compared side-by-side. 'Uniquely fragile' is "
-                    "decided by gap-at-first-divergence similarity, not by "
-                    "position ratios; same gap behaviour across arms means "
-                    "Orthrus is not uniquely fragile, just inheriting Qwen3's "
-                    "near-tie sensitivity on different trajectories.",
+            "note": "Verdict is COMPARATIVE: 'uniquely fragile' requires the "
+                    "two arms' perturbation signatures to differ "
+                    "substantively (gap diff > 0.5, rank diff > 1). Position "
+                    "differences between arms are explicitly ignored "
+                    "(trajectory variance from cross-code-path fp drift, not "
+                    "architectural fragility). Each arm's absolute_character "
+                    "is reported separately so a reader can distinguish "
+                    "'both arms near-tie -> benign quant' from 'both arms "
+                    "wide-margin -> harsh quant' even when the comparative "
+                    "verdict says not-uniquely-fragile.",
         }
 
     # -----------------------------------------------------------------

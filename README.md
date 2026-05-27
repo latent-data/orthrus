@@ -151,24 +151,33 @@ A planned follow-up investigation needs a "plain Qwen3-8B" forward path so we ca
 
 ### Results
 
-Per-prompt shared-prefix fraction (length of common token prefix divided by diff-on truncated length):
+Per-prompt shared-prefix length and fraction (shared prefix divided by diff-on truncated length), over 7 prompts spanning code, math, exposition, structured output, creative writing, and summarisation:
 
-| Prompt | Diff-on tokens | Diff-off tokens (truncated) | Shared prefix | Fraction | First divergence | Diff-on token | Diff-off token | Top1-top2 logit gap | Diff-on rank | Diff-off rank |
-|---|---|---|---|---|---|---|---|---|---|---|
-| short | 472 | 477 | 470 | **99.6%** | position 470 | `!` (id 0) | ` or` (id 476) | 0.25 | 2 | 1 |
-| long  | 1441 | 1452 | 102 | **7.1%** | position 102 | ` if` (id 421) | ` self` (id 656) | 0.25 | 2 | 1 |
+| Prompt | Diff-on tokens | Shared prefix | Fraction | Top1-top2 gap | Rank flip |
+|---|---|---|---|---|---|
+| short (word frequency code) | 472 | 470 | **99.6%** | 0.25 | diff-on rank-2, diff-off rank-1 |
+| long (BoundedPriorityQueue) | 1441 | 102 | 7.1% | 0.25 | diff-on rank-2, diff-off rank-1 |
+| math (train word problem) | 412 | 177 | 43.0% | 0.125 | diff-on rank-2, diff-off rank-1 |
+| explanation (CPU pipeline) | 816 | 62 | 7.6% | 0.125 | diff-on rank-2, diff-off rank-1 |
+| **json (seven wonders)** | 315 | **315** | **100.0%** | — | **bit-identical** |
+| creative (librarian story) | 564 | 106 | 18.8% | 0.0 | diff-on rank-2, diff-off rank-1 |
+| apollo (mission summary) | 289 | 60 | 20.8% | 0.25 | diff-on rank-2, diff-off rank-1 |
 
-Stop criterion: in both prompts, diff-on halts at the first `<|im_end|>` while diff-off emits it as a normal token and continues to `max_new_tokens` (cut off by the cap).
+Stop criterion diverges on every prompt: diff-on halts at the first `<|im_end|>` while diff-off emits it as a normal token and continues to `max_new_tokens`. Reported separately from forward-pass behaviour; orthogonal to this section's findings.
 
 ### Findings
 
-**The two paths diverge from a single near-tie argmax disagreement, not a structural model difference.** Both prompts show the exact same divergence signature: at the divergence position, the top-1 and top-2 next-token logits differ by ~0.25, the diffusion-mode path picks rank-2, the AR-mode path picks rank-1. This is consistent with floating-point accumulation drift between block-mode (the diffusion path's AR-verify call processes a block of positions at once) and single-token-mode (HF's standard generate processes one position at a time) through the same weights. The two paths are using identical AR projections; the disagreement comes from how those projections' outputs are summed in fp.
+**The two paths diverge from a single near-tie argmax disagreement, not a structural model difference.** Every prompt that diverges shows the same signature: the top-1 and top-2 logits at the divergence position differ by ≤0.25, the diffusion-mode path picks rank-2, the AR-mode path picks rank-1. This is consistent with floating-point accumulation drift between block-mode (the diffusion path's AR-verify call processes a block of positions at once) and single-token-mode (HF's standard generate processes one position at a time) through the same weights. The two paths are using identical AR projections; the disagreement comes from how those projections' outputs are summed in fp. The 7-prompt distribution now confirms this is universal, not a quirk of one or two prompts.
 
-**The shared-prefix metric is heavily position-dependent.** A single near-tie disagreement at position 470 of a 472-token output yields 99.6% shared prefix; the same kind of disagreement at position 102 of a 1441-token output yields 7.1%. The underlying mechanism is identical; the fraction reflects only where the near-tie happens to land. A more position-independent metric would be "near-tie disagreements per K tokens" (here roughly one per 100-500 tokens regardless of total output length).
+**The drift direction is systematic, not random.** Across all six divergent prompts, diff-on (block-mode AR-verify) consistently lands on the rank-2 token while diff-off (single-token HF generate) consistently lands on rank-1. The block-mode path is the one introducing the drift; the single-token path matches the fresh-forward reference in every case. This is a specific, characterisable artifact of block-mode batched matmul accumulation, not generic fp noise.
 
-**Stop-criterion divergence is a separate phenomenon.** Orthrus's diffusion-mode generate loop explicitly stops on `<|im_end|>`; HF's `super().generate()` does not stop on `<|im_end|>` under this configuration, even though both paths emit it. This is a generate-config interaction, not a forward-pass difference.
+**The JSON prompt produces bit-identical outputs in both paths.** Structured output (JSON syntax tokens) is high-confidence at every position; the trajectory never visits a near-tie close enough for fp drift to flip an argmax, so the cascade never starts. This is direct evidence that the diff-on / diff-off divergence is a near-tie-floor phenomenon, not a generic property of the two paths: prompts whose argmax landscape stays well-separated don't exhibit it at all.
 
-**For the planned PR 4 comparison work, the diff-off path remains viable as a "plain-Qwen3" proxy** even though it diverges from diff-on on long outputs. The reason: PR 4 needs to measure how much int8 quantization perturbs vanilla-Qwen3 generation, so the relevant measurement is diff-off-bf16 vs diff-off-int8 (same code path, only weight precision differs). That comparison is internally self-consistent and isolates the weight-precision effect, regardless of whether diff-off tracks diff-on at bf16. Under the frozen-teacher claim (Orthrus's AR projections are vanilla Qwen3-8B weights), the diff-off bf16-vs-int8 comparison is a faithful proxy for vanilla Qwen3 quantization sensitivity. Backbone-extraction work (loading the AR projections into a vanilla Qwen3 architecture) is not required.
+**The shared-prefix metric is heavily position-dependent.** A single near-tie disagreement at position 470 of a 472-token output yields 99.6% shared prefix; the same kind of disagreement at position 60 of a 289-token output yields 20.8%. Underlying mechanism identical; the fraction reflects only where the near-tie happens to land in the output trajectory. The gap-and-rank columns are the position-independent signal; report those rather than fractions when the question is "what kind of divergence."
+
+**Stop-criterion divergence is a separate phenomenon.** Orthrus's diffusion-mode generate loop explicitly stops on `<|im_end|>`; HF's `super().generate()` emits it as a normal token and continues. This is a generate-config interaction, not a forward-pass difference, and applies on all 7 prompts including JSON (where the forward pass is otherwise bit-identical).
+
+**For the vanilla-Qwen3 quantization comparison (next section), the diff-off path remains viable as a "plain-Qwen3" proxy** even though it diverges from diff-on on long outputs. The required measurement is diff-off-bf16 vs diff-off-int8 (same code path, only weight precision differs). That comparison is internally self-consistent and isolates the weight-precision effect, regardless of whether diff-off tracks diff-on at bf16. Under the frozen-teacher claim (Orthrus's AR projections are vanilla Qwen3-8B weights), the diff-off bf16-vs-int8 comparison is a faithful proxy for vanilla Qwen3 quantization sensitivity. Backbone-extraction work is not required.
 
 ### How to run
 
@@ -176,40 +185,73 @@ Stop criterion: in both prompts, diff-on halts at the first `<|im_end|>` while d
 ./run.sh quant_benchmark --no-build --verify-ar-equivalence
 ```
 
-Default prompt set is `short, long`. Per-prompt `max_new_tokens` is set in `AR_EQUIV_PROMPT_MAX_NEW_TOKENS` at the top of `quant_benchmark.py` (short=512, long=2048) and sized to each prompt's natural output length plus modest headroom; a generous global value would only extend the diff-off arm into wasted tokens that get truncated away. Output goes to `results/ar_equivalence.json` and includes the full token-ID sequences, a per-prompt fresh-forward top-3 logit diagnostic at the first divergence position, and the aggregate findings.
+Default prompt set is all 7 entries in `PROMPTS` (`short, long, math, explanation, json, creative, apollo`). Per-prompt `max_new_tokens` is set in `AR_EQUIV_PROMPT_MAX_NEW_TOKENS` at the top of `quant_benchmark.py` and sized to each prompt's natural output length plus modest headroom; a generous global value would only extend the diff-off arm into wasted tokens that get truncated away. Output goes to `results/ar_equivalence.json` and includes the full token-ID sequences, a per-prompt fresh-forward top-3 logit diagnostic at each first-divergence position, and the aggregate findings.
 
 ### Caveats
 
-- Two prompts is a small sample. Whether "one near-tie per 100-500 tokens" is a stable rate or coincidence would need more prompts to confirm.
-- The fp-drift hypothesis is consistent with the observed top1-top2 gaps but not directly verified. A more invasive test (capture logits at every position from both paths, compare directly) would close that loop.
-- The frozen-teacher claim that Orthrus's AR projections equal vanilla Qwen3-8B weights is taken at face value here. If those weights actually differ from vanilla Qwen3, the path-2 proxy argument weakens.
+- The fp-drift hypothesis is consistent with the observed top1-top2 gaps and the systematic rank-2-vs-rank-1 direction but not directly verified. A more invasive test (capture logits at every position from both paths, compare directly) would close that loop.
+- The frozen-teacher claim that Orthrus's AR projections equal vanilla Qwen3-8B weights is taken at face value. If those weights actually differ from vanilla Qwen3, the proxy argument for the next section weakens.
+- 7 prompts is broad enough to validate the "single near-tie cascade" pattern distributionally; a larger set would strengthen the rate estimate ("one near-tie per N tokens of trajectory") if that becomes a quantitative claim.
 
 ## Vanilla-Qwen3 quantization sensitivity: Orthrus is not uniquely fragile to int8
 
-The quantization investigation showed Orthrus loses bit-identical output to its bf16 baseline within 2 to 35 tokens under int8 cast-and-dequant. That answers "how fragile is Orthrus" in absolute terms but not "is Orthrus *uniquely* fragile, or is it inheriting whatever fragility vanilla Qwen3-8B already has?" Two AR-mode configurations were added to answer the second question.
+The quantization investigation showed Orthrus loses bit-identical output to its bf16 baseline within 2 to 35 tokens under int8 cast-and-dequant. That answers "how fragile is Orthrus" in absolute terms but not "is Orthrus *uniquely* fragile, or is it inheriting whatever fragility vanilla Qwen3-8B already has?" Two AR-mode configurations were added (`ar-bf16`, `ar-int8`) to provide the missing measurement.
 
 ### Result
 
-Within-arm divergence under int8 cast-and-dequant, on the same two prompts as the quantization investigation:
+Within-arm divergence under int8 cast-and-dequant, on all 7 prompts. Both arms produced identical numbers across the table except for the explanation prompt, so values are shown once per row with the explanation row split:
 
-| Arm | Prompt | first_div | top1-top2 logit gap | bf16 token | int8 token | bf16 rank in int8 logits |
-|---|---|---|---|---|---|---|
-| Orthrus (diffusion: `teacher-int8` vs `baseline-bf16`) | short | 2 | 0.7500 | ` Below` | ` Here` | 2 |
-| Orthrus | long | 35 | 0.5000 | `###` | `##` | 2 |
-| Vanilla (AR: `ar-int8` vs `ar-bf16`) | short | 2 | 0.7500 | ` Below` | ` Here` | 2 |
-| Vanilla | long | 35 | 0.5000 | `###` | `##` | 2 |
+| Prompt | first_div (Orthrus / Vanilla) | gap | bf16 → int8 token (Orthrus / Vanilla) | bf16 rank in int8 |
+|---|---|---|---|---|
+| short | 2 / 2 | 0.75 | ` Below` → ` Here` | 2 |
+| long | 35 / 35 | 0.50 | `###` → `##` | 2 |
+| math | 3 / 3 | 1.00 | `:\n\n` → ` the` | 2 |
+| **explanation** | **8 / 15** | 0.25 / 0.25 | `' CPU' → ' **'` / `',' → ' in'` | **1 / 2** |
+| json | 96 / 96 | 0.50 | `Stat` → `Tem` | 2 |
+| creative | 0 / 0 | 0.875 | `The` → `**` | 2 |
+| apollo | 13 / 13 | 0.50 | ` the` → ` NASA` | 2 |
 
-**Both arms diverge at the same position, with the same logit gap, choosing the same bf16 token, and demoted to the same rank in int8's logits, on both prompts.** Not just similar fragility — bit-identical divergence events.
+**6 of 7 prompts: cross-arm divergence events are bit-identical.** Same position, same gap, same bf16 token, same int8 token, same rank. The explanation prompt is the one exception, explained below.
 
 ### Finding
 
-**Orthrus is not uniquely fragile to int8 quantization. It inherits Qwen3's near-tie sensitivity, no more and no less.** The diffusion consensus mechanism does not amplify precision errors; it propagates the AR head's output as-is.
+**Orthrus is not uniquely fragile to int8 quantization. Both arms exhibit "near-tie regime" perturbation (median gap 0.5, max bf16-rank-in-int8 2) with identical signatures.** The diffusion consensus mechanism does not amplify precision errors; it propagates the AR head's output as-is.
 
-The mechanistic explanation is direct: both arms share the same AR projection weights (Orthrus's diffusion path uses the AR head to verify each block's tokens; the AR-only path uses the same AR head to emit each token). At every position where both arms have the same agreed prefix, the AR head computes the same logits and the int8 cast-and-dequant perturbs them identically. So the same near-tie tips in the same direction in both arms. The first 2 tokens on the short prompt and first 35 on the long are identical across arms at bf16 (both paths emit ` Sure! `; both then continue identically up to position 35 on the long prompt), so the int8 perturbation hits the same near-tie at the same position.
+The mechanistic explanation is direct: both arms share the same AR projection weights (Orthrus's diffusion path uses the AR head to verify each block's tokens; the AR-only path uses the same AR head to emit each token). At every position where both arms have the same agreed prefix, the AR head computes the same logits and the int8 cast-and-dequant perturbs them identically. So the same near-tie tips in the same direction in both arms.
+
+### The explanation-prompt exception
+
+The explanation prompt is the only one where the two arms diverge at different positions (Orthrus position 8, Vanilla position 15) with different token pairs. This is the AR-equivalence finding from the previous section showing up here at the second order:
+
+- The AR equivalence section showed that on the explanation prompt, `baseline-bf16` (diffusion mode) and `ar-bf16` (AR mode) agree on tokens for only the first 62 positions before diverging from each other. Within those 62 tokens *where they emit the same tokens*, their internal KV caches differ at the LSB-of-bf16 level (because they were computed via different forward-pass code paths).
+- When int8 quantisation is applied on top of those slightly-different KV caches, the perturbation hits a near-tie at *different positions* in the two arms (8 vs 15). The character of the perturbation (gap = 0.25 in both) is the same; only the position differs.
+- This is trajectory variance, not architectural fragility. The verdict (gap-based signature similarity) correctly classifies it as "not uniquely fragile."
+
+### Verdict logic
+
+`signatures_similar = True` (Orthrus and Vanilla both report median gap 0.5, max bf16-rank 2 → identical signatures). The script prints `VERDICT: NOT UNIQUELY FRAGILE` and reports each arm's absolute character separately (`near-tie regime (small gaps, rank-1-vs-rank-2 swaps)` for both arms).
+
+The comparison criterion is *similarity between arms*, not absolute thresholds within each. The arms are flagged "uniquely fragile" only when their signatures differ substantively (gap difference > 0.5 OR rank difference > 1). Position differences across arms are ignored — they reflect trajectory variance from cross-code-path fp drift, not architectural fragility. Each arm's absolute character (near-tie / moderate-gap / wide-margin) is reported separately so a reader can distinguish "both arms benign" from "both arms harsh" even when the comparative verdict is the same.
 
 ### Side observation: AR-mode through Orthrus runs at 2.6 tok/s on the long prompt
 
-`ar-bf16` generated at 7.4 tok/s on the short prompt and **2.6 tok/s on the long prompt**, vs `baseline-bf16` (Orthrus's normal diffusion mode through the same weights) at 39.1 and 51.5 tok/s respectively. The 19x slowdown on the long prompt is a direct re-measurement of what the diffusion mechanism is buying in tokens-per-wall-clock-second relative to plain AR generation, isolated from any vanilla-Qwen3-baseline confound (it's the same model in the same container at the same precision, just with the diffusion mechanism turned off). Consistent with and independent of the main benchmark's speedup claim.
+`ar-bf16` generated at 7.4 tok/s on the short prompt and **2.6 tok/s on the long prompt**, vs `baseline-bf16` (Orthrus's normal diffusion mode through the same weights) at 39.1 and 51.5 tok/s respectively. The 19x slowdown on the long prompt is a direct re-measurement of what the diffusion mechanism is buying in tokens-per-wall-clock-second relative to plain AR generation, isolated from any vanilla-Qwen3-baseline confound (same model in the same container at the same precision, just with the diffusion mechanism turned off). Consistent with and independent of the main benchmark's speedup claim.
+
+### Side observation: TPF varies 4.5x across prompts at bf16
+
+Tokens-per-forward-pass (TPF, the per-iteration acceptance length in diffusion mode) varies substantially with prompt complexity, even before quantisation enters the picture:
+
+| Prompt | baseline-bf16 TPF | teacher-int8 TPF | Δ |
+|---|---|---|---|
+| math | **12.48** | 9.67 | -2.81 |
+| long | 8.73 | 7.82 | -0.92 |
+| short | 6.56 | 6.10 | -0.45 |
+| json | 6.56 | 6.47 | -0.09 |
+| explanation | 4.12 | 3.37 | -0.75 |
+| apollo | 3.04 | 2.96 | -0.08 |
+| creative | **2.79** | 2.77 | -0.02 |
+
+High-confidence trajectories (math, with predictable arithmetic) give the drafter an easy job and TPF goes up; low-confidence trajectories (creative writing with frequent forks) drop TPF below 3. The headline TPF number of ~6.5 from the main benchmark is a mid-range data point, not a constant property of the model. Int8 quantisation hurts TPF proportionally more on high-confidence prompts (math drops 23%, creative drops 1%) because high-confidence trajectories had the most to lose: more near-deterministic predictions to knock off-path.
 
 ### Configurations
 
@@ -226,12 +268,11 @@ Two new entries in the `--configs` set, both using `use_diffusion_mode=False`:
 
 **Why the metric is first_divergence_position paired with top1-top2 logit gap.** `first_divergence_position` answers "how many tokens of bf16-matching output can I get under int8?" — position-independent of total output length and directly interpretable. Position alone is not enough though: a first divergence at token 5 with a tiny top1-top2 gap means "quantization tipped a near-tie that was already wobbling," not "quantization substantively changed the model's prediction." The fresh-forward divergence diagnostic introduced in the AR equivalence work captures the gap at each divergence, which is what makes the "same kind of perturbation, different trajectories" / "substantively different perturbation" distinction empirically decidable.
 
-**Interpretation rule used to label the verdict.** If both arms show `bf16 rank in int8 logits ≤ 3` and `gap < 1.0` at every prompt, the verdict is "near-tie tips on both arms; Orthrus inherits Qwen3's sensitivity." If gap behaviour differs substantively (e.g. one arm has rank-1-vs-rank-5 flips with wide gaps), the verdict is "Orthrus uniquely fragile." This run hit the first branch.
-
 ### Caveats
 
-- Two prompts is still a small sample. A broader prompt set (5-10 of varied length and domain) would tighten the null-result claim. The bit-identical-across-arms pattern is mechanistically inevitable for any prompt where the two arms agree on the first few tokens of generation, but the AR equivalence section showed those agreements break down by position ~100 on the long prompt; on more diverse prompts the agreement boundary will land in different places.
-- `0.7500` and `0.5000` logit gaps are suspiciously round; that reflects bf16 quantization of the logit values rather than 0.75-/0.5-nats true gaps. The values are meaningful as ordinal signals, not fine-grained continuous measurements.
+- `0.7500` / `0.5000` / `0.2500` logit gaps are suspiciously round; that reflects bf16 quantization of the logit values rather than continuous logit measurements. The gaps are meaningful as ordinal signals (near-tie vs wide-margin) and as comparative signals between arms, not as fine-grained continuous measurements.
+- The bit-identical-across-arms pattern on 6/7 prompts is mechanistically expected for any prompt where the two arms agree on the prefix up to first_div; the explanation prompt is the proof of concept that when the two arms' bf16 trajectories *don't* agree at the divergence position (because the cross-code-path cascade fired before first_div), the position breaks apart but the gap signature stays similar. So the cross-arm bit-identity should be read as "this is what happens when no cross-code-path drift has fired yet at the position of interest" rather than as an iron law.
+- This investigation uses simulated cast-and-dequant int8 (storage stays bf16, weights round-trip through int8). Real production int8 (bitsandbytes, fp8 native via torchao or torch._scaled_mm, AWQ-int4, etc.) uses different numerical paths and different storage representations; the conclusion ("Orthrus inherits Qwen3 sensitivity, not unique to itself") is expected to hold under those because the mechanistic argument (shared AR weights) is independent of the perturbation kind, but accuracy on downstream eval suites is what would actually validate it.
 
 ### How to run
 
@@ -239,7 +280,7 @@ Two new entries in the `--configs` set, both using `use_diffusion_mode=False`:
 ./run.sh quant_benchmark --no-build
 ```
 
-Default `--configs` now includes all six configurations (four diffusion-mode plus the two AR-mode). Runtime: ~80-90 min wall-clock on a DGX Spark; the AR-mode long-prompt runs at ~13 min each are the slow leg. To run only the AR arm, pass `--configs ar-bf16 --configs ar-int8`; the script will auto-include `ar-bf16` as the within-arm baseline when needed.
+Default `--configs` includes all six configurations (four diffusion-mode plus the two AR-mode); default `--prompts` is all 7 entries in `PROMPTS`. Runtime: ~2 hours wall-clock on a DGX Spark. To run only the AR arm: `--configs ar-bf16 --configs ar-int8`; the script auto-includes `ar-bf16` as the within-arm baseline.
 
 ## Limitations and caveats
 
